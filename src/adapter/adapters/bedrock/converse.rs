@@ -14,13 +14,14 @@ use serde_json::{Map, Value, json};
 use tracing::warn;
 use value_ext::JsonValueExt;
 
-/// Which Bedrock publisher a model ID targets. Used only to fill
+/// Which Bedrock publisher or model family a model ID targets. Used only to fill
 /// `additionalModelRequestFields` — message shape is identical across publishers.
 #[derive(Debug, Clone, Copy)]
 pub(super) enum BedrockPublisher {
 	Anthropic,
 	AmazonNova,
 	OpenAI,
+	OpenAIGptOss,
 	Other,
 }
 
@@ -30,13 +31,14 @@ impl BedrockPublisher {
 	pub(super) fn from_model_id(model_id: &str) -> Self {
 		let mut segments = model_id.split('.');
 		let publisher = match segments.next().unwrap_or_default() {
-			"us" | "eu" | "apac" | "global" => segments.next().unwrap_or_default(),
+			"us" | "eu" | "apac" | "global" | "in" => segments.next().unwrap_or_default(),
 			publisher => publisher,
 		};
 
 		match publisher {
 			"anthropic" => Self::Anthropic,
 			"amazon" => Self::AmazonNova, // Nova models; Titan would also hit this
+			"openai" if segments.next().unwrap_or_default().starts_with("gpt-oss-") => Self::OpenAIGptOss,
 			"openai" => Self::OpenAI,
 			_ => Self::Other,
 		}
@@ -220,7 +222,7 @@ fn resolve_max_tokens(model_name: &str, options_set: &ChatOptionsSet) -> u32 {
 				}
 			}
 			BedrockPublisher::AmazonNova => 5000,
-			BedrockPublisher::OpenAI | BedrockPublisher::Other => 4096,
+			BedrockPublisher::OpenAI | BedrockPublisher::OpenAIGptOss | BedrockPublisher::Other => 4096,
 		}
 	})
 }
@@ -252,7 +254,7 @@ fn publisher_additional_fields(publisher: BedrockPublisher, effort: &ReasoningEf
 				})),
 			}
 		}
-		BedrockPublisher::OpenAI => {
+		BedrockPublisher::OpenAI | BedrockPublisher::OpenAIGptOss => {
 			let keyword = match effort {
 				ReasoningEffort::Zero => "none",
 				ReasoningEffort::Low => "low",
@@ -263,7 +265,12 @@ fn publisher_additional_fields(publisher: BedrockPublisher, effort: &ReasoningEf
 				ReasoningEffort::Minimal => "minimal",
 				ReasoningEffort::Budget(_) => return None,
 			};
-			Some(json!({ "reasoning_effort": keyword }))
+			// GPT-OSS uses a flat field; newer OpenAI models use nested reasoning.effort.
+			Some(if matches!(publisher, BedrockPublisher::OpenAIGptOss) {
+				json!({ "reasoning_effort": keyword })
+			} else {
+				json!({ "reasoning": { "effort": keyword } })
+			})
 		}
 		BedrockPublisher::Other => None,
 	}
@@ -509,20 +516,24 @@ mod tests {
 	use crate::adapter::AdapterKind;
 	use crate::chat::ChatOptions;
 
+	const OPENAI_MODELS: &[(&str, bool)] = &[
+		("openai.gpt-oss-20b-1:0", true),
+		("openai.gpt-oss-120b-1:0", true),
+		("openai.gpt-5.6-luna", false),
+		("openai.gpt-5.6-terra", false),
+		("openai.gpt-5.6-sol", false),
+		("openai.gpt-6-astra", false),
+	];
+	const PROFILE_PREFIXES: &[&str] = &["", "us.", "eu.", "apac.", "global.", "in."];
+
 	#[test]
-	fn openai_reasoning_effort_is_sent() -> Result<()> {
+	fn openai_reasoning_effort_uses_model_specific_fields() -> Result<()> {
 		for adapter in [
 			AdapterKind::BedrockApi,
 			#[cfg(feature = "bedrock-sigv4")]
 			AdapterKind::BedrockSigv4,
 		] {
-			for model in [
-				"openai.gpt-oss-120b-1:0",
-				"us.openai.gpt-oss-120b-1:0",
-				"eu.openai.gpt-oss-120b-1:0",
-				"apac.openai.gpt-oss-120b-1:0",
-				"global.openai.gpt-oss-120b-1:0",
-			] {
+			for &(model, is_gpt_oss) in OPENAI_MODELS {
 				for (effort, keyword) in [
 					(ReasoningEffort::Zero, "none"),
 					(ReasoningEffort::Low, "low"),
@@ -533,16 +544,21 @@ mod tests {
 					(ReasoningEffort::Minimal, "minimal"),
 				] {
 					let options = ChatOptions::default().with_reasoning_effort(effort);
-					let payload = build_converse_payload(
-						&ModelIden::new(adapter, model),
-						ChatRequest::default(),
-						ChatOptionsSet::default().with_chat_options(Some(&options)),
-					)?;
-					assert_eq!(
-						payload["additionalModelRequestFields"],
-						json!({ "reasoning_effort": keyword })
-					);
-					assert_eq!(payload["inferenceConfig"]["maxTokens"], 4096);
+					for prefix in PROFILE_PREFIXES {
+						let model = format!("{prefix}{model}");
+						let payload = build_converse_payload(
+							&ModelIden::new(adapter, model.as_str()),
+							ChatRequest::default(),
+							ChatOptionsSet::default().with_chat_options(Some(&options)),
+						)?;
+						let expected = if is_gpt_oss {
+							json!({ "reasoning_effort": keyword })
+						} else {
+							json!({ "reasoning": { "effort": keyword } })
+						};
+						assert_eq!(payload["additionalModelRequestFields"], expected, "{model}: {keyword}");
+						assert_eq!(payload["inferenceConfig"]["maxTokens"], 4096);
+					}
 				}
 			}
 		}
@@ -551,17 +567,45 @@ mod tests {
 
 	#[test]
 	fn openai_unset_effort_and_budget_are_omitted() -> Result<()> {
-		for options in [
-			ChatOptions::default(),
-			ChatOptions::default().with_reasoning_effort(ReasoningEffort::Budget(1024)),
+		for adapter in [
+			AdapterKind::BedrockApi,
+			#[cfg(feature = "bedrock-sigv4")]
+			AdapterKind::BedrockSigv4,
+		] {
+			for options in [
+				ChatOptions::default(),
+				ChatOptions::default().with_reasoning_effort(ReasoningEffort::Budget(1024)),
+			] {
+				for &(model, _) in OPENAI_MODELS {
+					for prefix in PROFILE_PREFIXES {
+						let payload = build_converse_payload(
+							&ModelIden::new(adapter, format!("{prefix}{model}")),
+							ChatRequest::default(),
+							ChatOptionsSet::default().with_chat_options(Some(&options)),
+						)?;
+						assert!(payload.get("additionalModelRequestFields").is_none());
+						assert_eq!(payload["inferenceConfig"]["maxTokens"], 4096);
+					}
+				}
+			}
+		}
+		Ok(())
+	}
+
+	#[test]
+	fn custom_ids_containing_openai_are_not_reclassified() -> Result<()> {
+		let options = ChatOptions::default().with_reasoning_effort(ReasoningEffort::High);
+		for model in [
+			"custom.openai.gpt-5.6-luna",
+			"us.custom.openai.gpt-5.6-luna",
+			"custom-openai.gpt-oss-120b-1:0",
 		] {
 			let payload = build_converse_payload(
-				&ModelIden::new(AdapterKind::BedrockApi, "openai.gpt-oss-120b-1:0"),
+				&ModelIden::new(AdapterKind::BedrockApi, model),
 				ChatRequest::default(),
 				ChatOptionsSet::default().with_chat_options(Some(&options)),
 			)?;
 			assert!(payload.get("additionalModelRequestFields").is_none());
-			assert_eq!(payload["inferenceConfig"]["maxTokens"], 4096);
 		}
 		Ok(())
 	}
@@ -569,7 +613,7 @@ mod tests {
 	#[test]
 	fn other_publishers_keep_their_reasoning_fields() -> Result<()> {
 		let options = ChatOptions::default().with_reasoning_effort(ReasoningEffort::High);
-		for prefix in ["", "us.", "eu.", "apac.", "global."] {
+		for prefix in PROFILE_PREFIXES {
 			for (model, expected) in [
 				(
 					"anthropic.claude-sonnet-4-5",
