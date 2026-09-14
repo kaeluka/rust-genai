@@ -20,6 +20,7 @@ use value_ext::JsonValueExt;
 pub(super) enum BedrockPublisher {
 	Anthropic,
 	AmazonNova,
+	OpenAI,
 	Other,
 }
 
@@ -27,21 +28,16 @@ impl BedrockPublisher {
 	/// Model IDs are of the form `<publisher>.<model>...` or
 	/// `<region>.<publisher>.<model>...` (cross-region inference profiles).
 	pub(super) fn from_model_id(model_id: &str) -> Self {
-		// Strip an optional leading "us."/"eu."/"apac." inference-profile prefix so we can
-		// match the real publisher segment.
-		let tail = model_id.split_once('.').map(|(_, rest)| rest).unwrap_or(model_id);
-		let publisher_segment = tail.split_once('.').map(|(p, _)| p).unwrap_or(tail);
-
-		// For non-profile IDs, the leading segment IS the publisher.
-		let publisher = if publisher_segment.is_empty() {
-			model_id.split_once('.').map(|(p, _)| p).unwrap_or(model_id)
-		} else {
-			publisher_segment
+		let mut segments = model_id.split('.');
+		let publisher = match segments.next().unwrap_or_default() {
+			"us" | "eu" | "apac" | "global" => segments.next().unwrap_or_default(),
+			publisher => publisher,
 		};
 
 		match publisher {
 			"anthropic" => Self::Anthropic,
 			"amazon" => Self::AmazonNova, // Nova models; Titan would also hit this
+			"openai" => Self::OpenAI,
 			_ => Self::Other,
 		}
 	}
@@ -224,7 +220,7 @@ fn resolve_max_tokens(model_name: &str, options_set: &ChatOptionsSet) -> u32 {
 				}
 			}
 			BedrockPublisher::AmazonNova => 5000,
-			BedrockPublisher::Other => 4096,
+			BedrockPublisher::OpenAI | BedrockPublisher::Other => 4096,
 		}
 	})
 }
@@ -255,6 +251,19 @@ fn publisher_additional_fields(publisher: BedrockPublisher, effort: &ReasoningEf
 					"inferenceConfig": { "reasoningConfig": { "type": "enabled" } }
 				})),
 			}
+		}
+		BedrockPublisher::OpenAI => {
+			let keyword = match effort {
+				ReasoningEffort::Zero => "none",
+				ReasoningEffort::Low => "low",
+				ReasoningEffort::Medium => "medium",
+				ReasoningEffort::High => "high",
+				ReasoningEffort::XHigh => "xhigh",
+				ReasoningEffort::Max => "max",
+				ReasoningEffort::Minimal => "minimal",
+				ReasoningEffort::Budget(_) => return None,
+			};
+			Some(json!({ "reasoning_effort": keyword }))
 		}
 		BedrockPublisher::Other => None,
 	}
@@ -492,4 +501,94 @@ fn tool_to_converse_tool(tool: Tool) -> Result<Value> {
 	}
 
 	Ok(json!({ "toolSpec": tool_spec }))
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use crate::adapter::AdapterKind;
+	use crate::chat::ChatOptions;
+
+	#[test]
+	fn openai_reasoning_effort_is_sent() -> Result<()> {
+		for adapter in [
+			AdapterKind::BedrockApi,
+			#[cfg(feature = "bedrock-sigv4")]
+			AdapterKind::BedrockSigv4,
+		] {
+			for model in [
+				"openai.gpt-oss-120b-1:0",
+				"us.openai.gpt-oss-120b-1:0",
+				"eu.openai.gpt-oss-120b-1:0",
+				"apac.openai.gpt-oss-120b-1:0",
+				"global.openai.gpt-oss-120b-1:0",
+			] {
+				for (effort, keyword) in [
+					(ReasoningEffort::Zero, "none"),
+					(ReasoningEffort::Low, "low"),
+					(ReasoningEffort::Medium, "medium"),
+					(ReasoningEffort::High, "high"),
+					(ReasoningEffort::XHigh, "xhigh"),
+					(ReasoningEffort::Max, "max"),
+					(ReasoningEffort::Minimal, "minimal"),
+				] {
+					let options = ChatOptions::default().with_reasoning_effort(effort);
+					let payload = build_converse_payload(
+						&ModelIden::new(adapter, model),
+						ChatRequest::default(),
+						ChatOptionsSet::default().with_chat_options(Some(&options)),
+					)?;
+					assert_eq!(
+						payload["additionalModelRequestFields"],
+						json!({ "reasoning_effort": keyword })
+					);
+					assert_eq!(payload["inferenceConfig"]["maxTokens"], 4096);
+				}
+			}
+		}
+		Ok(())
+	}
+
+	#[test]
+	fn openai_unset_effort_and_budget_are_omitted() -> Result<()> {
+		for options in [
+			ChatOptions::default(),
+			ChatOptions::default().with_reasoning_effort(ReasoningEffort::Budget(1024)),
+		] {
+			let payload = build_converse_payload(
+				&ModelIden::new(AdapterKind::BedrockApi, "openai.gpt-oss-120b-1:0"),
+				ChatRequest::default(),
+				ChatOptionsSet::default().with_chat_options(Some(&options)),
+			)?;
+			assert!(payload.get("additionalModelRequestFields").is_none());
+			assert_eq!(payload["inferenceConfig"]["maxTokens"], 4096);
+		}
+		Ok(())
+	}
+
+	#[test]
+	fn other_publishers_keep_their_reasoning_fields() -> Result<()> {
+		let options = ChatOptions::default().with_reasoning_effort(ReasoningEffort::High);
+		for prefix in ["", "us.", "eu.", "apac.", "global."] {
+			for (model, expected) in [
+				(
+					"anthropic.claude-sonnet-4-5",
+					json!({ "thinking": { "type": "enabled", "budget_tokens": 24000 } }),
+				),
+				(
+					"amazon.nova-pro-v1:0",
+					json!({ "inferenceConfig": { "reasoningConfig": { "type": "enabled" } } }),
+				),
+				("meta.llama3-1-70b-instruct-v1:0", Value::Null),
+			] {
+				let payload = build_converse_payload(
+					&ModelIden::new(AdapterKind::BedrockApi, format!("{prefix}{model}")),
+					ChatRequest::default(),
+					ChatOptionsSet::default().with_chat_options(Some(&options)),
+				)?;
+				assert_eq!(payload["additionalModelRequestFields"], expected);
+			}
+		}
+		Ok(())
+	}
 }
